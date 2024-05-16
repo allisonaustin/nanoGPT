@@ -35,3 +35,7 @@ warmup_iters = 100 # not super necessary potentially
 # on macbook also add
 # device = 'cpu'  # run on cpu only
 # compile = False # do not torch compile the model
+
+# size of key and query vectors
+# kqv_size = 32
+kqv_size = 8
