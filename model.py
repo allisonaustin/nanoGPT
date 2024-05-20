@@ -43,6 +43,7 @@ class CausalSelfAttention(nn.Module):
         self.kqv_size = config.kqv_size # size of key and query vectors
         self.kq_proj = nn.Linear(config.n_embd // config.n_head, config.kqv_size)
         self.dropout = config.dropout
+        self.wind = config.wind
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -51,7 +52,7 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
             
-    def forward(self, x):
+    def forward(self, x, mask=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -66,11 +67,13 @@ class CausalSelfAttention(nn.Module):
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            window_mask = torch.tril(torch.ones(T, T, device=x.device), diagonal=-self.wind)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att = att.masked_fill(window_mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -105,8 +108,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, mask=None):
+        x = x + self.attn(self.ln_1(x), mask)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -118,6 +121,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     kqv_size: int = 64
+    wind: int = 100
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
@@ -173,7 +177,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, mask=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -184,7 +188,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, mask)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -309,7 +313,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, mask=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -319,7 +323,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _ = self(idx_cond, mask=mask)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options

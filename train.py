@@ -26,6 +26,7 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
+import matplotlib.pyplot as plt
 
 from model import GPTConfig, GPT
 
@@ -53,6 +54,7 @@ n_layer = 12
 n_head = 12
 n_embd = 768
 kqv_size = 64 
+wind = 100
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
@@ -134,6 +136,8 @@ def get_batch(split):
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
+training_time = time.time()
+loss_arr = []
 
 # attempt to derive vocab_size from the dataset
 meta_path = os.path.join(data_dir, 'meta.pkl')
@@ -145,7 +149,7 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, kqv_size=kqv_size, block_size=block_size,
+model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, kqv_size=kqv_size, wind=wind, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -328,9 +332,17 @@ while True:
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
+    loss_arr.append(lossf)
 
     # termination conditions
     if iter_num > max_iters:
+        print(f"total training time: {(time.time() - training_time)*1000:.2f}ms")
+        plt.figure(figsize=(10,6))
+        plt.plot(loss_arr, label='Loss', color='blue')
+        plt.xlabel('Iter')
+        plt.ylabel('Loss')
+        plt.title('Sliding window size=10')
+        plt.show()
         break
 
 if ddp:

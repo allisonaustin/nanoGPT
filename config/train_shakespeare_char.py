@@ -37,5 +37,6 @@ warmup_iters = 100 # not super necessary potentially
 # compile = False # do not torch compile the model
 
 # size of key and query vectors
-# kqv_size = 32
-kqv_size = 8
+kqv_size = 32
+# size of sliding window attention
+wind = 10
