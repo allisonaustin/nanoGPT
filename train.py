@@ -338,10 +338,9 @@ while True:
     if iter_num > max_iters:
         print(f"total training time: {(time.time() - training_time)*1000:.2f}ms")
         plt.figure(figsize=(10,6))
-        plt.plot(loss_arr, label='Loss', color='blue')
-        plt.xlabel('Iter')
+        plt.plot(loss_arr, label='loss', color='blue')
+        plt.xlabel('Step')
         plt.ylabel('Loss')
-        plt.title('Sliding window size=10')
         plt.show()
         break
 

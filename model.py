@@ -42,8 +42,9 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.kqv_size = config.kqv_size # size of key and query vectors
         self.kq_proj = nn.Linear(config.n_embd // config.n_head, config.kqv_size)
+        self.attn_sink = nn.Parameter(torch.randn(1, 4, self.n_embd))
+        self.recent_size = config.wind
         self.dropout = config.dropout
-        self.wind = config.wind
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
@@ -51,34 +52,45 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
-            
-    def forward(self, x, mask=None):
+                       
+    def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         # reducing dimensionality of query and key vectors using linear transformation
-        k = self.kq_proj(k)
-        q = self.kq_proj(q)
+        k = self.kq_proj(k) # (B, nh, T, kqv_size)
+        q = self.kq_proj(q) # (B, nh, T, kqv_size)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # self.flash = False # for testing sliding window
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            window_mask = torch.tril(torch.ones(T, T, device=x.device), diagonal=-self.wind)
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = att.masked_fill(window_mask == 0, float('-inf'))
+            # getting most recent tokens 
+            if T > self.recent_size:
+                cached_k = k[:, :, -self.recent_size:]
+                cached_q = q[:, :, -self.recent_size:]
+                cached_v = v[:, :, -self.recent_size:]
+            # sliding window mask 
+            mask = torch.tril(torch.ones(self.recent_size, self.recent_size, device=x.device), diagonal=-self.recent_size) # (wind, wind)
+            att = (cached_q @ cached_k.transpose(-2, -1)) * (1.0 / math.sqrt(cached_k.size(-1))) # (B, nh, wind, wind)
+            att = att.masked_fill(mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
+            y = att @ cached_v # (B, nh, wind, wind) x (B, nh, wind, hs) -> (B, nh, wind, hs)
+        
+        # evicted tokens 
+        v_evict = v[:, :, :T-self.recent_size] # (B, T - wind, C)
+        y_recent = y[:, :, -self.recent_size:]
+        # concatenating the attended values with the values that weren't attended to
+        y = torch.cat([v_evict, y_recent], dim=2)  # (B, T, C)
+        # re-assembling head output side by side
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
@@ -88,13 +100,17 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_fc2   = nn.Linear(4 * config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.gelu    = nn.GELU()
+        self.relu    = nn.ReLU()
         self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.gelu(x)
+        x = self.relu(x)
+        # changing MLP layer to LLaMA model fc3(ReLu(fc1(x)) * fc2(x))
+        x = x * self.c_fc2(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
@@ -108,8 +124,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, mask=None):
-        x = x + self.attn(self.ln_1(x), mask)
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -177,7 +193,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, mask=None):
+    def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -188,7 +204,7 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
-            x = block(x, mask)
+            x = block(x)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -313,7 +329,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, mask=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -323,7 +339,7 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond, mask=mask)
+            logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
