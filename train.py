@@ -341,6 +341,7 @@ while True:
         plt.plot(loss_arr, label='loss', color='blue')
         plt.xlabel('Step')
         plt.ylabel('Loss')
+        plt.title('Softmax with abs(.)')
         plt.show()
         break
 

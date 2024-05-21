@@ -42,7 +42,6 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.kqv_size = config.kqv_size # size of key and query vectors
         self.kq_proj = nn.Linear(config.n_embd // config.n_head, config.kqv_size)
-        self.attn_sink = nn.Parameter(torch.randn(1, 4, self.n_embd))
         self.recent_size = config.wind
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
@@ -65,30 +64,25 @@ class CausalSelfAttention(nn.Module):
         q = self.kq_proj(q) # (B, nh, T, kqv_size)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        # self.flash = False # for testing sliding window
+        self.flash = False # for testing sliding window and abs softmax
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            # getting most recent tokens 
-            if T > self.recent_size:
-                cached_k = k[:, :, -self.recent_size:]
-                cached_q = q[:, :, -self.recent_size:]
-                cached_v = v[:, :, -self.recent_size:]
             # sliding window mask 
-            mask = torch.tril(torch.ones(self.recent_size, self.recent_size, device=x.device), diagonal=-self.recent_size) # (wind, wind)
-            att = (cached_q @ cached_k.transpose(-2, -1)) * (1.0 / math.sqrt(cached_k.size(-1))) # (B, nh, wind, wind)
+            # mask = torch.eye(T, device=x.device)
+            # for i in range(1, self.recent_size):
+            #     mask += torch.eye(T, device=x.device, dtype=torch.bool).roll(i, dims=1)
+            mask = torch.ones(T, T, device=x.device)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
             att = att.masked_fill(mask == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
+            # att = F.softmax(att, dim=-1)
+            # replacing exp operation in softmax with abs operation
+            numerator = torch.abs(att)
+            att = numerator / (torch.sum(numerator) + 1e-12)
             att = self.attn_dropout(att)
-            y = att @ cached_v # (B, nh, wind, wind) x (B, nh, wind, hs) -> (B, nh, wind, hs)
-        
-        # evicted tokens 
-        v_evict = v[:, :, :T-self.recent_size] # (B, T - wind, C)
-        y_recent = y[:, :, -self.recent_size:]
-        # concatenating the attended values with the values that weren't attended to
-        y = torch.cat([v_evict, y_recent], dim=2)  # (B, T, C)
+            y = att @ v
         # re-assembling head output side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # output projection
@@ -108,9 +102,9 @@ class MLP(nn.Module):
 
     def forward(self, x):
         x = self.c_fc(x)
-        x = self.relu(x)
+        x = self.gelu(x)
         # changing MLP layer to LLaMA model fc3(ReLu(fc1(x)) * fc2(x))
-        x = x * self.c_fc2(x)
+        # x = x * self.c_fc2(x)
         x = self.c_proj(x)
         x = self.dropout(x)
         return x

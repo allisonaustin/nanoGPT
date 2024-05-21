@@ -39,4 +39,4 @@ warmup_iters = 100 # not super necessary potentially
 # size of key and query vectors
 kqv_size = 64
 # size of sliding window attention
-wind = 100
+wind = 3
