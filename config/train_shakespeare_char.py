@@ -40,3 +40,5 @@ warmup_iters = 100 # not super necessary potentially
 kqv_size = 64
 # size of sliding window attention
 wind = 3
+# number of register tokens
+n_regist = 5

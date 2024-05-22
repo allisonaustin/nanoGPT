@@ -40,6 +40,7 @@ class CausalSelfAttention(nn.Module):
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.n_regist = config.n_regist
         self.kqv_size = config.kqv_size # size of key and query vectors
         self.kq_proj = nn.Linear(config.n_embd // config.n_head, config.kqv_size)
         self.recent_size = config.wind
@@ -64,23 +65,24 @@ class CausalSelfAttention(nn.Module):
         q = self.kq_proj(q) # (B, nh, T, kqv_size)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        self.flash = False # for testing sliding window and abs softmax
+        ##### for testing sliding window and abs(.) softmax --> uncomment the following line to test
+        # self.flash = False
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
             # sliding window mask 
-            # mask = torch.eye(T, device=x.device)
-            # for i in range(1, self.recent_size):
-            #     mask += torch.eye(T, device=x.device, dtype=torch.bool).roll(i, dims=1)
-            mask = torch.ones(T, T, device=x.device)
+            mask = torch.eye(T, device=x.device)
+            for i in range(1, self.recent_size):
+                mask += torch.eye(T, device=x.device, dtype=torch.bool).roll(i, dims=1)
+            # mask = torch.ones(T, T, device=x.device)
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) 
             att = att.masked_fill(mask == 0, float('-inf'))
-            # att = F.softmax(att, dim=-1)
-            # replacing exp operation in softmax with abs operation
-            numerator = torch.abs(att)
-            att = numerator / (torch.sum(numerator) + 1e-12)
+            att = F.softmax(att, dim=-1)
+            # replacing exp operation in softmax with abs operation --> uncomment the following two lines and the above line to test
+            # numerator = torch.abs(att)
+            # att = numerator / (torch.sum(numerator) + 1e-12)
             att = self.attn_dropout(att)
             y = att @ v
         # re-assembling head output side by side
@@ -103,7 +105,7 @@ class MLP(nn.Module):
     def forward(self, x):
         x = self.c_fc(x)
         x = self.gelu(x)
-        # changing MLP layer to LLaMA model fc3(ReLu(fc1(x)) * fc2(x))
+        # changing MLP layer to LLaMA model fc3(ReLu(fc1(x)) * fc2(x)) --> uncomment following line to test
         # x = x * self.c_fc2(x)
         x = self.c_proj(x)
         x = self.dropout(x)
@@ -130,6 +132,7 @@ class GPTConfig:
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
+    n_regist: int = 1
     kqv_size: int = 64
     wind: int = 100
     dropout: float = 0.0
@@ -145,7 +148,8 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            wre = nn.Embedding(config.n_regist, config.n_embd), # register token embeddings, https://medium.com/@mandalsouvik/vision-transformers-need-registers-ca7ded042d6a
+            wpe = nn.Embedding(config.block_size + config.n_regist, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -191,15 +195,26 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
+        pos = torch.arange(0, t + self.config.n_regist, dtype=torch.long, device=device) # shape (t + n_regist)
+        # register embeddings
+        r_pos = torch.arange(self.config.n_regist, dtype=torch.long, device=device) # shape (1, n_regist, n_embd)
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t + n_regist, n_embd)
+        pos_emb = self.transformer.wpe(pos).unsqueeze(0).expand(b, -1, -1)  # position embeddings of shape (t, n_embd)
+        reg_emb = self.transformer.wre(r_pos).unsqueeze(0).expand(b, -1, -1)  # register embeddings of shape (1, n_regist, n_embd)
+        # x = self.transformer.drop(tok_emb + pos_emb)
+
+        # concatenating register and token embeddings
+        x = torch.cat((reg_emb, tok_emb), dim=1) # shape (b, t + n_regist, n_embd)
+        # adding positional embeddings
+        x = x + pos_emb[:, :x.size(1), :]
+        x = self.transformer.drop(x)
+
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
+        # extracting output for token positions (ignoring register tokens)
+        x = x[:, self.config.n_regist:, :]
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
